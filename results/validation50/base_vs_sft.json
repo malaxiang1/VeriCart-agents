@@ -1,0 +1,43 @@
+{
+  "expected_tasks": 50,
+  "baseline_completed": 50,
+  "candidate_completed": 50,
+  "metrics": {
+    "strict_success": {
+      "baseline": 0.0,
+      "candidate": 0.58,
+      "absolute_delta": 0.58,
+      "relative_delta": null,
+      "paired_95ci": [
+        0.44,
+        0.72
+      ]
+    },
+    "purchase_success": {
+      "baseline": 0.0,
+      "candidate": 0.58,
+      "absolute_delta": 0.58,
+      "relative_delta": null,
+      "paired_95ci": [
+        0.44,
+        0.72
+      ]
+    },
+    "final_reward": {
+      "baseline": -0.155125,
+      "candidate": 0.39085416666666667,
+      "absolute_delta": 0.5459791666666667,
+      "relative_delta": 3.519607843137255,
+      "paired_95ci": [
+        0.3172291666666667,
+        0.7776697916666665
+      ]
+    }
+  },
+  "strict_transitions": {
+    "loss": 0,
+    "win": 29,
+    "both_success": 0,
+    "both_failure": 21
+  }
+}

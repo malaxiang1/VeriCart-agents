@@ -1,0 +1,705 @@
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -18,6 +18,8 @@
+ This trainer supports model-agonistic model initialization with huggingface
+ """
+ 
++# SHOPPING_GRPO_DYNAMIC_SAMPLING_PATCH_V3
++
+ import json
+ import os
+ import uuid
+@@ -1307,8 +1309,10 @@
+             if is_distillation_enabled(self.config.get("distillation"))
+             else False
+         )
+-        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
++        ppo_mini_batch_size = batch.meta_info.pop("partial_valid_global_batch_size", None)
++        if ppo_mini_batch_size is None:
++            ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
++            ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
+         seed = self.config.actor_rollout_ref.actor.data_loader_seed
+         shuffle = self.config.actor_rollout_ref.actor.shuffle
+@@ -1380,6 +1384,89 @@
+             config=OmegaConf.to_container(self.config, resolve=True),
+         )
+ 
++        from shopping_grpo.training.grpo.dynamic_sampling import (
++            aggregate_shopping_metrics,
++            extract_shopping_group_signals,
++            select_exact_trajectory_pack,
++            select_largest_divisible_trajectory_pack,
++            select_partial_valid_groups,
++            select_reward_varying_groups,
++        )
++
++        dynamic_sampling_config = self.config.get("shopping_dynamic_sampling", {})
++        dynamic_sampling_enabled = bool(dynamic_sampling_config.get("enable", False))
++        if dynamic_sampling_enabled:
++            # GROUNDINGVISION_PARTIAL_VALID_GROUP_V1
++            dynamic_selection_mode = str(dynamic_sampling_config.get("selection_mode", "whole"))
++            if dynamic_selection_mode not in {"whole", "partial_valid"}:
++                raise ValueError(
++                    "shopping_dynamic_sampling.selection_mode must be 'whole' or "
++                    f"'partial_valid', got {dynamic_selection_mode!r}"
++                )
++            dynamic_sampling_metric = dynamic_sampling_config.get("metric", "seq_reward")
++            dynamic_max_gen_batches = int(dynamic_sampling_config.get("max_num_gen_batches", 0))
++            dynamic_max_consecutive_skips = int(
++                dynamic_sampling_config.get("max_consecutive_skipped_updates", 0)
++            )
++            dynamic_reward_tolerance = float(dynamic_sampling_config.get("reward_tolerance", 1.0e-8))
++            if dynamic_sampling_metric != "seq_reward":
++                raise ValueError(
++                    "shopping_dynamic_sampling.metric must be 'seq_reward', "
++                    f"got {dynamic_sampling_metric!r}"
++                )
++            if dynamic_max_gen_batches <= 0:
++                raise ValueError("shopping_dynamic_sampling.max_num_gen_batches must be positive")
++            if dynamic_max_consecutive_skips <= 0:
++                raise ValueError(
++                    "shopping_dynamic_sampling.max_consecutive_skipped_updates must be positive"
++                )
++            if dynamic_reward_tolerance < 0 or not np.isfinite(dynamic_reward_tolerance):
++                raise ValueError(
++                    "shopping_dynamic_sampling.reward_tolerance must be finite and non-negative"
++                )
++            if self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
++                raise ValueError("shopping_dynamic_sampling only supports Vanilla GRPO")
++            if not self.config.algorithm.rollout_correction.get("bypass_mode", False):
++                raise ValueError("shopping_dynamic_sampling requires rollout-log-prob bypass mode")
++            if not self.config.actor_rollout_ref.rollout.calculate_log_probs:
++                raise ValueError("shopping_dynamic_sampling requires rollout.calculate_log_probs=true")
++
++            dynamic_target_prompts = int(self.config.data.train_batch_size)
++            dynamic_rollout_n = int(self.config.actor_rollout_ref.rollout.n)
++            dynamic_target_trajectories = (
++                int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
++                * dynamic_rollout_n
++            )
++            dynamic_accepted_batches = []
++            dynamic_accepted_prompts = 0
++            dynamic_num_gen_batches = 0
++            dynamic_generated_groups = 0
++            dynamic_filtered_groups = 0
++            dynamic_all_equal_groups = 0
++            dynamic_all_zero_utility_groups = 0
++            dynamic_all_purchase_success_groups = 0
++            dynamic_no_purchase_success_groups = 0
++            dynamic_sampling_invalid_groups = 0
++            dynamic_generated_trajectories = 0
++            dynamic_skipped_updates = 0
++            dynamic_consecutive_skips = 0
++            print(
++                "SHOPPING_GRPO_DYNAMIC_SAMPLING_CONFIG "
++                + json.dumps(
++                    {
++                        "enable": True,
++                        "selection_mode": dynamic_selection_mode,
++                        "metric": dynamic_sampling_metric,
++                        "max_num_gen_batches": dynamic_max_gen_batches,
++                        "max_consecutive_skipped_updates": dynamic_max_consecutive_skips,
++                        "reward_tolerance": dynamic_reward_tolerance,
++                        "train_batch_size": dynamic_target_prompts,
++                        "rollout_n": dynamic_rollout_n,
++                    },
++                    sort_keys=True,
++                )
++            )
++
+         self.global_steps = 0
+ 
+         # load checkpoint and update weights before doing anything
+@@ -1406,14 +1493,17 @@
+         # add tqdm
+         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+ 
+-        # we start from step 1
+-        self.global_steps += 1
++        # The unpatched trainer uses a one-based in-flight step. Dynamic sampling
++        # keeps the committed counter unchanged until an optimizer update occurs.
++        if not dynamic_sampling_enabled:
++            self.global_steps += 1
+         last_val_metrics = None
+         self.max_steps_duration = 0
+ 
+         prev_step_profile = False
++        first_step = self.global_steps + 1 if dynamic_sampling_enabled else self.global_steps
+         curr_step_profile = (
+-            self.global_steps in self.config.global_profiler.steps
++            first_step in self.config.global_profiler.steps
+             if self.config.global_profiler.steps is not None
+             else False
+         )
+@@ -1421,6 +1511,8 @@
+ 
+         for epoch in range(current_epoch, self.config.trainer.total_epochs):
+             for batch_dict in self.train_dataloader:
++                current_step = self.global_steps + 1 if dynamic_sampling_enabled else self.global_steps
++                optimizer_updated = False
+                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
+                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
+                 metrics = {}
+@@ -1443,7 +1535,7 @@
+                 gen_batch = self._get_gen_batch(batch)
+ 
+                 # pass global_steps to trace
+-                gen_batch.meta_info["global_steps"] = self.global_steps
++                gen_batch.meta_info["global_steps"] = current_step
+                 rollout_n = self.config.actor_rollout_ref.rollout.n
+                 gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+ 
+@@ -1461,14 +1553,15 @@
+                     combined_gen_batch = gen_batch_output
+                     num_sampled_prompts = len(gen_batch_output)
+ 
+-                is_last_step = self.global_steps >= self.total_training_steps
++                is_last_step = current_step >= self.total_training_steps
+                 with marked_timer("step", timing_raw):
+                     # generate a batch
+                     with marked_timer("gen", timing_raw, color="red"):
+                         if curr_step_profile:
+                             self.llm_server_manager.start_profile()
+                         combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
+-                        self.checkpoint_manager.sleep_replicas()
++                        if not dynamic_sampling_enabled:
++                            self.checkpoint_manager.sleep_replicas()
+                         if curr_step_profile:
+                             self.llm_server_manager.stop_profile()
+ 
+@@ -1524,6 +1617,371 @@
+                         # extract reward_tensor and reward_extra_infos_dict for training
+                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+ 
++                    if dynamic_sampling_enabled:
++                        seq_rewards = reward_tensor.sum(dim=-1).detach().cpu().tolist()
++                        batch_uids = batch.non_tensor_batch["uid"].tolist()
++                        if "shopping" not in batch.non_tensor_batch:
++                            raise RuntimeError(
++                                "shopping dynamic sampling requires AgentLoop shopping diagnostics"
++                            )
++                        terminal_utilities, purchase_success, sampling_invalid, sampling_invalid_reasons = extract_shopping_group_signals(
++                            batch.non_tensor_batch["shopping"].tolist()
++                        )
++                        if dynamic_selection_mode == "partial_valid":
++                            _, group_stats = select_partial_valid_groups(
++                                batch_uids,
++                                seq_rewards,
++                                terminal_utilities=terminal_utilities,
++                                purchase_success=purchase_success,
++                                sampling_invalid=sampling_invalid,
++                                sampling_invalid_reasons=sampling_invalid_reasons,
++                                tolerance=dynamic_reward_tolerance,
++                            )
++                        else:
++                            _, group_stats = select_reward_varying_groups(
++                                batch_uids,
++                                seq_rewards,
++                                terminal_utilities=terminal_utilities, purchase_success=purchase_success,
++                                sampling_invalid=sampling_invalid, sampling_invalid_reasons=sampling_invalid_reasons,
++                                tolerance=dynamic_reward_tolerance,
++                            )
++                        invalid_group_sizes = [
++                            len(group["indices"])
++                            for group in group_stats["groups"]
++                            if len(group["indices"]) != dynamic_rollout_n
++                        ]
++                        if invalid_group_sizes:
++                            raise RuntimeError(
++                                "shopping dynamic sampling found uid groups whose sizes do not match "
++                                f"rollout.n={dynamic_rollout_n}: {invalid_group_sizes}"
++                            )
++
++                        dynamic_num_gen_batches += 1
++                        dynamic_generated_groups += group_stats["num_groups"]
++                        dynamic_filtered_groups += group_stats["dropped_group_count"]
++                        dynamic_all_equal_groups += group_stats["all_equal_group_count"]
++                        dynamic_all_zero_utility_groups += group_stats[
++                            "all_zero_utility_group_count"
++                        ]
++                        dynamic_all_purchase_success_groups += group_stats[
++                            "all_purchase_success_group_count"
++                        ]
++                        dynamic_no_purchase_success_groups += group_stats["no_purchase_success_group_count"]
++                        dynamic_sampling_invalid_groups += group_stats[
++                            "sampling_invalid_group_count"
++                        ]
++                        dynamic_generated_trajectories += group_stats["num_trajectories"]
++                        if dynamic_selection_mode == "partial_valid":
++                            accepted_uids = list(group_stats["kept_uids"])
++                            accepted_uid_set = set(accepted_uids)
++                            accepted_indices = []
++                        else:
++                            remaining_prompts = dynamic_target_prompts - dynamic_accepted_prompts
++                            accepted_uids = list(group_stats["kept_uids"][:remaining_prompts])
++                            accepted_uid_set = set(accepted_uids)
++                            accepted_indices = [
++                                index for index, uid in enumerate(batch_uids) if uid in accepted_uid_set
++                            ]
++                        print(
++                            "SHOPPING_GRPO_DYNAMIC_SAMPLING_BATCH "
++                            + json.dumps(
++                                {
++                                    "generation_batch": dynamic_num_gen_batches,
++                                    "groups": [
++                                        {
++                                            "uid": group["uid"],
++                                            "rewards": group["rewards"],
++                                            "terminal_utilities": group["terminal_utilities"],
++                                            "purchase_success": group["purchase_success"],
++                                            "sampling_invalid": group["sampling_invalid"],
++                                            "sampling_invalid_reasons": group["sampling_invalid_reasons"],
++                                            "drop_reason": group["drop_reason"],
++                                            "kept": group["kept"],
++                                            "accepted": group["uid"] in accepted_uid_set,
++                                        }
++                                        for group in group_stats["groups"]
++                                    ],
++                                    "accepted_prompts_after_batch": (
++                                        dynamic_accepted_prompts + len(accepted_uids)
++                                    ),
++                                    "target_prompts": dynamic_target_prompts,
++                                },
++                                sort_keys=True,
++                            )
++                        )
++                        if dynamic_selection_mode == "partial_valid":
++                            for group in group_stats["groups"]:
++                                if not group["kept"]:
++                                    continue
++                                accepted_batch = batch.select_idxs(list(group["retained_indices"]))
++                                accepted_batch.meta_info.pop("global_token_num", None)
++                                accepted_batch.meta_info.pop("images_seqlens", None)
++                                dynamic_accepted_batches.append(accepted_batch)
++                            pack = select_largest_divisible_trajectory_pack(
++                                [len(candidate) for candidate in dynamic_accepted_batches],
++                                max_trajectories=dynamic_target_prompts * dynamic_rollout_n,
++                                divisor=int(self.config.trainer.n_gpus_per_node),
++                            )
++                            if pack is not None:
++                                dynamic_accepted_batches = [
++                                    dynamic_accepted_batches[position] for position in pack
++                                ]
++                                dynamic_accepted_prompts = dynamic_target_prompts
++                        elif accepted_indices:
++                            accepted_batch = batch.select_idxs(accepted_indices)
++                            accepted_batch.meta_info.pop("global_token_num", None)
++                            accepted_batch.meta_info.pop("images_seqlens", None)
++                            dynamic_accepted_batches.append(accepted_batch)
++                            dynamic_accepted_prompts += len(accepted_uids)
++
++                        if dynamic_accepted_prompts < dynamic_target_prompts:
++                            if curr_step_profile:
++                                self._stop_profiling(True)
++                            if dynamic_num_gen_batches >= dynamic_max_gen_batches:
++                                dynamic_skipped_updates += 1
++                                dynamic_consecutive_skips += 1
++                                skipped_metrics = {
++                                    "training/global_step": self.global_steps,
++                                    "training/optimizer_updated": 0,
++                                    "shopping_dynamic_sampling/skipped_update": 1,
++                                    "shopping_dynamic_sampling/skipped_updates_total": (
++                                        dynamic_skipped_updates
++                                    ),
++                                    "shopping_dynamic_sampling/consecutive_skips": (
++                                        dynamic_consecutive_skips
++                                    ),
++                                    "group/generated": dynamic_generated_groups,
++                                    "group/trained": dynamic_accepted_prompts,
++                                    "group/effective_ratio": (
++                                        dynamic_accepted_prompts
++                                        / max(dynamic_generated_groups, 1)
++                                    ),
++                                    "group/all_equal_ratio": (
++                                        dynamic_all_equal_groups
++                                        / max(dynamic_generated_groups, 1)
++                                    ),
++                                    "group/all_zero_utility_ratio": (
++                                        dynamic_all_zero_utility_groups
++                                        / max(dynamic_generated_groups, 1)
++                                    ),
++                                    "group/no_purchase_success_ratio": (
++                                        dynamic_no_purchase_success_groups
++                                        / max(dynamic_generated_groups, 1)
++                                    ),
++                                    "group/all_purchase_success_ratio": (
++                                        dynamic_all_purchase_success_groups
++                                        / max(dynamic_generated_groups, 1)
++                                    ),
++                                    "group/sampling_invalid": (
++                                        dynamic_sampling_invalid_groups
++                                    ),
++                                    "group/resample_batches": max(
++                                        dynamic_num_gen_batches - 1, 0
++                                    ),
++                                    "rollout/generated_total": (
++                                        dynamic_generated_trajectories
++                                    ),
++                                }
++                                print(
++                                    "SHOPPING_GRPO_DYNAMIC_SAMPLING_SKIPPED "
++                                    + json.dumps(
++                                        {
++                                            "accepted_prompts": dynamic_accepted_prompts,
++                                            "target_prompts": dynamic_target_prompts,
++                                            "generation_batches": dynamic_num_gen_batches,
++                                            "generated_groups": dynamic_generated_groups,
++                                            "generated_trajectories": (
++                                                dynamic_generated_trajectories
++                                            ),
++                                            "all_equal_groups": (
++                                                dynamic_all_equal_groups
++                                            ),
++                                            "no_purchase_success_groups": (
++                                                dynamic_no_purchase_success_groups
++                                            ),
++                                            "sampling_invalid_groups": (
++                                                dynamic_sampling_invalid_groups
++                                            ),
++                                            "skipped_updates_total": (
++                                                dynamic_skipped_updates
++                                            ),
++                                            "consecutive_skips": (
++                                                dynamic_consecutive_skips
++                                            ),
++                                        },
++                                        sort_keys=True,
++                                    )
++                                )
++                                logger.log(data=skipped_metrics, step=self.global_steps)
++                                dynamic_accepted_batches = []
++                                dynamic_accepted_prompts = 0
++                                dynamic_num_gen_batches = 0
++                                dynamic_generated_groups = 0
++                                dynamic_filtered_groups = 0
++                                dynamic_all_equal_groups = 0
++                                dynamic_all_zero_utility_groups = 0
++                                dynamic_all_purchase_success_groups = 0
++                                dynamic_no_purchase_success_groups = 0
++                                dynamic_sampling_invalid_groups = 0
++                                dynamic_generated_trajectories = 0
++                                if (
++                                    dynamic_consecutive_skips
++                                    >= dynamic_max_consecutive_skips
++                                ):
++                                    raise RuntimeError(
++                                        "shopping dynamic sampling reached "
++                                        "max_consecutive_skipped_updates="
++                                        f"{dynamic_max_consecutive_skips} without an "
++                                        "optimizer update; stopping a persistently "
++                                        "no-signal run"
++                                    )
++                            continue
++
++                        batch = DataProto.concat(dynamic_accepted_batches)
++                        if dynamic_selection_mode == "partial_valid":
++                            batch.meta_info["partial_valid_global_batch_size"] = len(batch)
++                            dynamic_accepted_prompts = len(
++                                set(batch.non_tensor_batch["uid"].tolist())
++                            )
++                        if self.config.trainer.balance_batch:
++                            self._balance_batch(batch, metrics=metrics)
++                        batch.meta_info["global_token_num"] = torch.sum(
++                            batch.batch["attention_mask"], dim=-1
++                        ).tolist()
++                        images_seqlens_all = []
++                        for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
++                            if "image_grid_thw" not in multi_modal_input.keys():
++                                continue
++                            images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
++                        batch.meta_info["images_seqlens"] = images_seqlens_all
++                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
++                        metrics.update(
++                            {
++                                "group/generated": dynamic_generated_groups,
++                                "group/trained": dynamic_accepted_prompts,
++                                "group/effective_ratio": (
++                                    dynamic_accepted_prompts / max(dynamic_generated_groups, 1)
++                                ),
++                                "group/all_equal_ratio": (
++                                    dynamic_all_equal_groups / max(dynamic_generated_groups, 1)
++                                ),
++                                "group/all_zero_utility_ratio": (
++                                    dynamic_all_zero_utility_groups
++                                    / max(dynamic_generated_groups, 1)
++                                ),
++                                "group/no_purchase_success_ratio": (
++                                    dynamic_no_purchase_success_groups
++                                    / max(dynamic_generated_groups, 1)
++                                ),
++                                "group/all_purchase_success_ratio": (
++                                    dynamic_all_purchase_success_groups
++                                    / max(dynamic_generated_groups, 1)
++                                ),
++                                "group/sampling_invalid": (
++                                    dynamic_sampling_invalid_groups
++                                ),
++                                "group/resample_batches": max(dynamic_num_gen_batches - 1, 0),
++                                "rollout/generated_total": dynamic_generated_trajectories,
++                            }
++                        )
++                        ready_terminal_utilities, ready_purchase_success, ready_sampling_invalid, ready_invalid_reasons = (
++                            extract_shopping_group_signals(
++                                batch.non_tensor_batch["shopping"].tolist()
++                            )
++                        )
++                        if dynamic_selection_mode == "partial_valid":
++                            _, ready_group_stats = select_partial_valid_groups(
++                                batch.non_tensor_batch["uid"].tolist(),
++                                reward_tensor.sum(dim=-1).detach().cpu().tolist(),
++                                terminal_utilities=ready_terminal_utilities,
++                                purchase_success=ready_purchase_success,
++                                sampling_invalid=ready_sampling_invalid,
++                                sampling_invalid_reasons=ready_invalid_reasons,
++                                tolerance=dynamic_reward_tolerance,
++                            )
++                        else:
++                            _, ready_group_stats = select_reward_varying_groups(
++                                batch.non_tensor_batch["uid"].tolist(),
++                                reward_tensor.sum(dim=-1).detach().cpu().tolist(),
++                                terminal_utilities=ready_terminal_utilities, purchase_success=ready_purchase_success,
++                                sampling_invalid=ready_sampling_invalid, sampling_invalid_reasons=ready_invalid_reasons,
++                                tolerance=dynamic_reward_tolerance,
++                            )
++                        print(
++                            "SHOPPING_GRPO_DYNAMIC_SAMPLING_READY "
++                            + json.dumps(
++                                {
++                                    "generation_batches": dynamic_num_gen_batches,
++                                    "generated_groups": dynamic_generated_groups,
++                                    "filtered_groups": dynamic_filtered_groups,
++                                    "generated_trajectories": dynamic_generated_trajectories,
++                                    "trained_groups": dynamic_accepted_prompts,
++                                    "trained_group_rewards": [
++                                        group["rewards"] for group in ready_group_stats["groups"]
++                                    ],
++                                },
++                                sort_keys=True,
++                            )
++                        )
++                        self.checkpoint_manager.sleep_replicas()
++                        dynamic_consecutive_skips = 0
++                        dynamic_accepted_batches = []
++                        dynamic_accepted_prompts = 0
++                        dynamic_num_gen_batches = 0
++                        dynamic_generated_groups = 0
++                        dynamic_filtered_groups = 0
++                        dynamic_all_equal_groups = 0
++                        dynamic_all_zero_utility_groups = 0
++                        dynamic_all_purchase_success_groups = 0
++                        dynamic_no_purchase_success_groups = 0
++                        dynamic_sampling_invalid_groups = 0
++                        dynamic_generated_trajectories = 0
++
++                    if "shopping" not in batch.non_tensor_batch:
++                        raise RuntimeError(
++                            "Shopping GRPO requires AgentLoop shopping diagnostics"
++                        )
++                    metrics.update(
++                        aggregate_shopping_metrics(
++                            batch.non_tensor_batch["shopping"].tolist()
++                        )
++                    )
++                    if not dynamic_sampling_enabled:
++                        terminal_utilities, purchase_success, sampling_invalid, sampling_invalid_reasons = extract_shopping_group_signals(
++                            batch.non_tensor_batch["shopping"].tolist()
++                        )
++                        _, group_stats = select_reward_varying_groups(
++                            batch.non_tensor_batch["uid"].tolist(),
++                            reward_tensor.sum(dim=-1).detach().cpu().tolist(),
++                            terminal_utilities=terminal_utilities, purchase_success=purchase_success,
++                            sampling_invalid=sampling_invalid, sampling_invalid_reasons=sampling_invalid_reasons,
++                        )
++                        group_count = max(group_stats["num_groups"], 1)
++                        metrics.update(
++                            {
++                                "group/generated": group_stats["num_groups"],
++                                "group/trained": group_stats["num_groups"],
++                                "group/effective_ratio": 1.0,
++                                "group/all_equal_ratio": (
++                                    group_stats["all_equal_group_count"] / group_count
++                                ),
++                                "group/all_zero_utility_ratio": (
++                                    group_stats["all_zero_utility_group_count"] / group_count
++                                ),
++                                "group/no_purchase_success_ratio": (
++                                    group_stats["no_purchase_success_group_count"] / group_count
++                                ),
++                                "group/all_purchase_success_ratio": (
++                                    group_stats["all_purchase_success_group_count"] / group_count
++                                ),
++                                "group/sampling_invalid": group_stats[
++                                    "sampling_invalid_group_count"
++                                ],
++                                "group/resample_batches": 0,
++                                "rollout/generated_total": group_stats["num_trajectories"],
++                            }
++                        )
++
+                     # Operating Mode Selection:
+                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+@@ -1602,6 +2060,21 @@
+                         else:
+                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+ 
++
++                        # GROUNDINGVISION_SHOPPING_EVENT_CREDIT_V1
++                        event_config = self.config.get("event_credit", {})
++                        if bool(event_config.get("enable", False)):
++                            from groundedvision.agentic_rl.event_credit import apply_shopping_event_rewards
++                            import groundedvision.integrations.verl_process_advantage  # noqa: F401
++
++                            batch, event_metrics = apply_shopping_event_rewards(
++                                batch,
++                                max_abs_event_reward=float(
++                                    event_config.get("max_abs_event_reward", 0.10)
++                                ),
++                            )
++                            metrics.update(event_metrics)
++
+                         # Compute rollout correction: IS weights, rejection sampling, and metrics
+                         # Only runs in decoupled mode (computes once per batch using stable π_old)
+                         # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+@@ -1632,6 +2105,41 @@
+                             config=self.config.algorithm,
+                         )
+ 
++                        # GROUNDINGVISION_SHOPPING_HGPO_V1
++                        shopping_hgpo_config = self.config.get("shopping_hgpo", {})
++                        if bool(shopping_hgpo_config.get("enable", False)):
++                            if self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
++                                raise ValueError("shopping_hgpo requires native GRPO as its base estimator")
++                            from groundedvision.agentic_rl.shopping_hgpo import apply_shopping_hgpo
++
++                            batch, hgpo_metrics = apply_shopping_hgpo(
++                                batch,
++                                gamma=float(shopping_hgpo_config.get("gamma", 0.95)),
++                                step_weight=float(shopping_hgpo_config.get("step_weight", 0.35)),
++                                history_length=int(shopping_hgpo_config.get("history_length", 2)),
++                                epsilon=float(shopping_hgpo_config.get("epsilon", 1.0e-6)),
++                            )
++                            metrics.update(hgpo_metrics)
++
++                        # GROUNDINGVISION_PAD_GRPO_HOOK_V1
++                        pad_config = self.config.get("pad_grpo", {})
++                        if bool(pad_config.get("enable", False)):
++                            from groundedvision.agentic_rl.pad_grpo import ProgressWeights
++                            from groundedvision.agentic_rl.verl_adapter import (
++                                apply_pad_recovery_to_batch,
++                            )
++
++                            batch, pad_metrics = apply_pad_recovery_to_batch(
++                                batch,
++                                progress_lambda=float(pad_config.get("progress_lambda", 0.1)),
++                                # GROUNDINGVISION_RC_PAD_V1
++                                confidence_margin=float(pad_config.get("confidence_margin", 0.05)),
++                                tolerance=float(pad_config.get("tolerance", 1.0e-8)),
++                                weights=ProgressWeights(**dict(pad_config.get("weights", {}))),
++                                expected_group_size=int(self.config.actor_rollout_ref.rollout.n),
++                            )
++                            metrics.update(pad_metrics)
++
+                     # update critic
+                     if self.use_critic:
+                         with marked_timer("update_critic", timing_raw, color="pink"):
+@@ -1640,13 +2148,16 @@
+                         metrics.update(critic_output_metrics)
+ 
+                     # implement critic warmup
+-                    if self.config.trainer.critic_warmup > self.global_steps:
++                    if self.config.trainer.critic_warmup > current_step:
+                         # Still in critic warmup, only update weights to wake up rollout replicas.
+-                        self.checkpoint_manager.update_weights(self.global_steps)
++                        self.checkpoint_manager.update_weights(current_step)
+                     else:
+                         # update actor
+                         with marked_timer("update_actor", timing_raw, color="red"):
+                             actor_output = self._update_actor(batch)
++                        optimizer_updated = True
++                        if dynamic_sampling_enabled:
++                            self.global_steps = current_step
+ 
+                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+                         esi_close_to_expiration = should_save_ckpt_esi(
+@@ -1662,7 +2173,7 @@
+                         # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
+                         if self.config.trainer.save_freq > 0 and (
+                             is_last_step
+-                            or self.global_steps % self.config.trainer.save_freq == 0
++                            or current_step % self.config.trainer.save_freq == 0
+                             or esi_close_to_expiration
+                         ):
+                             if esi_close_to_expiration:
+@@ -1672,7 +2183,7 @@
+ 
+                         # update weights from trainer to rollout
+                         with marked_timer("update_weights", timing_raw, color="red"):
+-                            self.checkpoint_manager.update_weights(self.global_steps)
++                            self.checkpoint_manager.update_weights(current_step)
+ 
+                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                         metrics.update(actor_output_metrics)
+@@ -1684,7 +2195,7 @@
+ 
+                 # validate
+                 if self.config.trainer.test_freq > 0 and (
+-                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
++                    is_last_step or current_step % self.config.trainer.test_freq == 0
+                 ):
+                     with marked_timer("testing", timing_raw, color="green"):
+                         val_metrics: dict = self._validate()
+@@ -1694,7 +2205,7 @@
+ 
+                 with marked_timer("stop_profile", timing_raw):
+                     next_step_profile = (
+-                        self.global_steps + 1 in self.config.global_profiler.steps
++                        current_step + 1 in self.config.global_profiler.steps
+                         if self.config.global_profiler.steps is not None
+                         else False
+                     )
+@@ -1712,10 +2223,23 @@
+                 # training metrics
+                 metrics.update(
+                     {
+-                        "training/global_step": self.global_steps,
++                        "training/global_step": current_step,
+                         "training/epoch": epoch,
++                        "training/optimizer_updated": int(optimizer_updated),
+                     }
+                 )
++                if dynamic_sampling_enabled:
++                    metrics.update(
++                        {
++                            "shopping_dynamic_sampling/skipped_update": 0,
++                            "shopping_dynamic_sampling/skipped_updates_total": (
++                                dynamic_skipped_updates
++                            ),
++                            "shopping_dynamic_sampling/consecutive_skips": (
++                                dynamic_consecutive_skips
++                            ),
++                        }
++                    )
+                 # collect metrics
+                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                 # GDPO per-component reward metrics
+@@ -1747,10 +2271,15 @@
+                 )
+ 
+                 # TODO: make a canonical logger that supports various backend
+-                logger.log(data=metrics, step=self.global_steps)
++                logger.log(data=metrics, step=current_step)
+ 
+                 progress_bar.update(1)
+-                self.global_steps += 1
++                if dynamic_sampling_enabled and not optimizer_updated:
++                    raise RuntimeError(
++                        "shopping dynamic sampling reached logging without an actor optimizer update"
++                    )
++                if not dynamic_sampling_enabled:
++                    self.global_steps += 1
+ 
+                 if is_last_step:
+                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):

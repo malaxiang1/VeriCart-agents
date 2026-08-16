@@ -1,0 +1,653 @@
+diff --git a/scripts/apply_verl_dynamic_sampling_patch.py b/scripts/apply_verl_dynamic_sampling_patch.py
+index 57863e8..afa57b8 100644
+--- a/scripts/apply_verl_dynamic_sampling_patch.py
++++ b/scripts/apply_verl_dynamic_sampling_patch.py
+@@ -16,6 +16,8 @@ from pathlib import Path
+ EXPECTED_VERL_VERSION = "0.8.0"
+ EXPECTED_ORIGINAL_SHA256 = "de58d295cf86656a28196b0718168d4a11666f3e30957b7e166914496c2a6d66"
+ EXPECTED_PATCHED_SHA256 = "fc3564cc5680a9fa92ca7b0a9bc3ae87ccdc90c498ab1bfe34c6796d6c54fb5a"
++EXPECTED_LAYERED_PATCHED_SHA256 = "15b2fb2f8802cbd88c2cfdaec0617aed52e714e94c0703f6aed1dc0fc636b7ce"
++EXPECTED_PARTIAL_VALID_LAYERED_SHA256 = "aca5c51b240427ad18419d620f9946b93fef6afc7b327a3c9a833107d52474ad"
+ PATCH_MARKER = "SHOPPING_GRPO_DYNAMIC_SAMPLING_PATCH_V3"
+ BACKUP_SUFFIX = ".shopping-grpo-dynamic-sampling.orig"
+ PROJECT_ROOT = Path(__file__).resolve().parents[1]
+@@ -62,10 +64,15 @@ def validate_runtime_and_target(target_override: Path | None) -> Path:
+ 
+ def verify_patched(target: Path) -> None:
+     target_hash = sha256(target)
+-    if target_hash != EXPECTED_PATCHED_SHA256:
++    accepted_hashes = {
++        EXPECTED_PATCHED_SHA256,
++        EXPECTED_LAYERED_PATCHED_SHA256,
++        EXPECTED_PARTIAL_VALID_LAYERED_SHA256,
++    }
++    if target_hash not in accepted_hashes:
+         raise RuntimeError(
+             "patched ray_trainer.py hash mismatch: "
+-            f"expected {EXPECTED_PATCHED_SHA256}, got {target_hash}"
++            f"expected one of {sorted(accepted_hashes)}, got {target_hash}"
+         )
+     if PATCH_MARKER not in target.read_text(encoding="utf-8"):
+         raise RuntimeError(f"patched ray_trainer.py is missing marker {PATCH_MARKER}")
+@@ -74,7 +81,11 @@ def verify_patched(target: Path) -> None:
+ 
+ def apply_patch(target: Path) -> None:
+     target_hash = sha256(target)
+-    if target_hash == EXPECTED_PATCHED_SHA256:
++    if target_hash in {
++        EXPECTED_PATCHED_SHA256,
++        EXPECTED_LAYERED_PATCHED_SHA256,
++        EXPECTED_PARTIAL_VALID_LAYERED_SHA256,
++    }:
+         verify_patched(target)
+         print(f"veRL dynamic-sampling patch already applied: {target}")
+         return
+@@ -120,6 +131,19 @@ def restore_patch(target: Path) -> None:
+     if target_hash == EXPECTED_ORIGINAL_SHA256:
+         print(f"veRL ray_trainer.py is already original: {target}")
+         return
++    if target_hash in {
++        EXPECTED_LAYERED_PATCHED_SHA256,
++        EXPECTED_PARTIAL_VALID_LAYERED_SHA256,
++    }:
++        raise RuntimeError(
++            "refusing to restore layered ray_trainer.py because it also contains "
++            "project PAD/Event hooks"
++        )
++    if target_hash != EXPECTED_PATCHED_SHA256:
++        raise RuntimeError(
++            "refusing to restore unknown ray_trainer.py: "
++            f"expected {EXPECTED_PATCHED_SHA256}, got {target_hash}"
++        )
+     if not backup.is_file():
+         raise RuntimeError(f"cannot restore without backup: {backup}")
+     backup_hash = sha256(backup)
+diff --git a/src/shopping_grpo/training/grpo/adapter/agent_loop.py b/src/shopping_grpo/training/grpo/adapter/agent_loop.py
+index 5b9014b..eb5b66d 100644
+--- a/src/shopping_grpo/training/grpo/adapter/agent_loop.py
++++ b/src/shopping_grpo/training/grpo/adapter/agent_loop.py
+@@ -168,6 +168,18 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
+             agent_data.prompt_ids = prompt_ids
+             agent_data.response_mask = response_mask
+             agent_data.response_logprobs = response_logprobs
++            # Event indices are response-relative. Keep them aligned with the
++            # compacted mask and discard events whose actor token was removed.
++            events = agent_data.extra_fields.get("shopping_events")
++            if events:
++                kept_events = []
++                for event in events:
++                    token_index = int(event["token_index"])
++                    if token_index >= stats.removed_tokens:
++                        kept = dict(event)
++                        kept["token_index"] = token_index - stats.removed_tokens
++                        kept_events.append(kept)
++                agent_data.extra_fields["shopping_events"] = kept_events
+             if runtime_state is not None:
+                 runtime_state["context_compactions"] += 1
+                 runtime_state["context_tokens_removed"] += stats.removed_tokens
+@@ -242,7 +254,40 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
+             runtime_state["termination_reason"] = "parallel_tool_calls"
+             runtime_state["error"] = "parallel_tool_calls"
+             return AgentState.TERMINATED
++        reward_count = len(agent_data.tool_rewards)
++        # The current assistant message has already been parsed into
++        # ``tool_calls`` before the parent executes it, so retain its name
++        # before the parent mutates tool state.
++        current_tool_call = agent_data.tool_calls[-1] if agent_data.tool_calls else None
++        try:
++            action_token_end = max(
++                index
++                for index, is_actor_token in enumerate(agent_data.response_mask)
++                if is_actor_token == 1
++            )
++        except ValueError as exc:
++            raise RuntimeError(
++                "tool processing requires an actor-generated response token"
++            ) from exc
++        if action_token_end >= self.response_length:
++            raise RuntimeError("shopping event token would be truncated from the response")
+         next_state = await super()._handle_processing_tools_state(agent_data)
++        new_rewards = agent_data.tool_rewards[reward_count:]
++        if new_rewards:
++            events = agent_data.extra_fields.setdefault("shopping_events", [])
++            # Keep zero-reward calls as step boundaries for HGPO. Reward v3 is
++            # unchanged: only non-zero values are projected into token rewards
++            # by the parent ToolAgentLoop; these events are metadata only.
++            for index, value in enumerate(new_rewards):
++                tool_call = current_tool_call
++                tool_name = getattr(tool_call, "name", "") if tool_call is not None else ""
++                events.append(
++                    {
++                        "token_index": action_token_end,
++                        "reward": float(value),
++                        "tool_name": str(tool_name),
++                    }
++                )
+         runtime_state = current_runtime_state.get()
+         if runtime_state is not None and runtime_state.get("terminate"):
+             return AgentState.TERMINATED
+@@ -261,6 +306,7 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
+         state = await session.start(task_id)
+         try:
+             output = await super().run(sampling_params, **kwargs)
++            output.extra_fields.setdefault("shopping_events", [])
+             if not state["done"] and not state["error"]:
+                 state["error"] = "assistant_finished_without_environment_done"
+                 state["termination_reason"] = state["error"]
+diff --git a/src/shopping_grpo/training/grpo/adapter/runtime.py b/src/shopping_grpo/training/grpo/adapter/runtime.py
+index a982dd1..dcf9385 100644
+--- a/src/shopping_grpo/training/grpo/adapter/runtime.py
++++ b/src/shopping_grpo/training/grpo/adapter/runtime.py
+@@ -89,10 +89,10 @@ def record_observation_projection(state: dict, meta: dict) -> None:
+     )
+ 
+ 
+-def record_action_attempt(state: dict, tool_name: str, parameters: dict, observation: str) -> None:
++def record_action_attempt(state: dict, tool_name: str, parameters: dict, observation: str) -> bool:
+     """记录环境动作尝试，并统计最近三次中的重复签名。"""
+     if tool_name == "think":
+-        return
++        return False
+     canonical_parameters = json.dumps(
+         parameters,
+         ensure_ascii=False,
+@@ -103,10 +103,12 @@ def record_action_attempt(state: dict, tool_name: str, parameters: dict, observa
+     signature = (str(tool_name), canonical_parameters, observation_fingerprint)
+     recent = state["recent_action_signatures"]
+     state["action_attempt_count"] += 1
+-    if signature in recent:
++    repeated = signature in recent
++    if repeated:
+         state["repeat_action_count"] += 1
+     recent.append(signature)
+     del recent[:-3]
++    return repeated
+ 
+ 
+ def validate_reward(raw_detail: object) -> dict:
+diff --git a/src/shopping_grpo/training/grpo/adapter/tools.py b/src/shopping_grpo/training/grpo/adapter/tools.py
+index e63f09d..6e70b0b 100644
+--- a/src/shopping_grpo/training/grpo/adapter/tools.py
++++ b/src/shopping_grpo/training/grpo/adapter/tools.py
+@@ -65,7 +65,7 @@ class ShopSimulatorTool(BaseTool):
+                 return ToolResponse(text="Error: maximum executed tool steps reached."), 0.0, step
+             return ToolResponse(text="Reasoning recorded. Continue with one environment tool call."), 0.0, step
+         observation = state.get("latest_observation", "")
+-        record_action_attempt(state, self.name, parameters, observation)
++        repeated = record_action_attempt(state, self.name, parameters, observation)
+         state["action_attempt_after_truncation_count"] += int(
+             bool(state.get("latest_observation_truncated"))
+         )
+@@ -78,10 +78,10 @@ class ShopSimulatorTool(BaseTool):
+             state["consecutive_guard_rejections"] += 1
+             if state["consecutive_guard_rejections"] >= 3:
+                 _terminate(state, "too_many_guard_rejections")
+-                return ToolResponse(text="Error: maximum consecutive action guard rejections reached."), 0.0, {
++                return ToolResponse(text="Error: maximum consecutive action guard rejections reached."), -0.05, {
+                     "reason": reason
+                 }
+-            return ToolResponse(text=f"Error: action guard rejected this call ({reason}); read the latest observation."), 0.0, {"reason": reason}
++            return ToolResponse(text=f"Error: action guard rejected this call ({reason}); read the latest observation."), -0.05, {"reason": reason}
+         try:
+             # 先转换成环境动作，再在线程中调用同步客户端；终局 reward 只信任
+             # 环境返回的 Reward v3 结构，避免训练侧自行猜测分数。
+@@ -158,14 +158,14 @@ class ShopSimulatorTool(BaseTool):
+                         state,
+                         "invalid_terminal_reward_detail:expected Reward v3",
+                     )
+-            return ToolResponse(text="Environment terminated."), 0.0, step
++            return ToolResponse(text="Environment terminated."), -0.03 if repeated else 0.0, step
+         state["latest_observation"] = observation
+         state["latest_observation_raw"] = observation
+         state["_pending_raw_observation"] = observation
+         if len(state["steps"]) >= state["max_steps"]:
+             _terminate(state, "max_steps")
+             return ToolResponse(text="Error: maximum executed tool steps reached."), 0.0, step
+-        return ToolResponse(text=observation), 0.0, step
++        return ToolResponse(text=observation), -0.03 if repeated else 0.0, step
+ 
+     async def release(self, instance_id, **kwargs):
+         # veRL 0.8 会在每次 tool call 后执行 release；真正的环境租约由 AgentLoop 释放。
+diff --git a/src/shopping_grpo/training/grpo/dynamic_sampling.py b/src/shopping_grpo/training/grpo/dynamic_sampling.py
+index 5427ff1..30dfea6 100644
+--- a/src/shopping_grpo/training/grpo/dynamic_sampling.py
++++ b/src/shopping_grpo/training/grpo/dynamic_sampling.py
+@@ -362,3 +362,218 @@ def select_reward_varying_groups(
+         "groups": tuple(groups),
+     }
+     return trajectory_indices, stats
++
++
++def select_partial_valid_groups(
++    uids: Sequence[Hashable],
++    seq_rewards: Sequence[float],
++    *,
++    terminal_utilities: Sequence[float],
++    purchase_success: Sequence[bool],
++    sampling_invalid: Sequence[bool],
++    sampling_invalid_reasons: Sequence[Sequence[str]],
++    tolerance: float = 1.0e-8,
++    min_valid_trajectories: int = 2,
++) -> tuple[list[int], dict[str, Any]]:
++    """Select only explicitly valid, reward-varying members of each GRPO group.
++
++    A sampling-invalid trajectory has no trustworthy terminal reward and must not
++    be converted into a zero-reward example.  This selector therefore retains a
++    partial group only when at least two explicitly valid trajectories remain and
++    their terminal utilities still differ.  The caller is responsible for packing
++    retained groups into an FSDP-compatible optimizer batch.
++    """
++    if min_valid_trajectories < 2:
++        raise ValueError("min_valid_trajectories must be at least two for GRPO")
++    if tolerance < 0 or not math.isfinite(tolerance):
++        raise ValueError(f"tolerance must be a finite non-negative number, got {tolerance!r}")
++
++    sequences = {
++        "seq_rewards": seq_rewards,
++        "terminal_utilities": terminal_utilities,
++        "purchase_success": purchase_success,
++        "sampling_invalid": sampling_invalid,
++        "sampling_invalid_reasons": sampling_invalid_reasons,
++    }
++    for name, values in sequences.items():
++        if len(values) != len(uids):
++            raise ValueError(f"{name} must have the same length as uids")
++
++    grouped: dict[Hashable, dict[str, Any]] = {}
++    for index, values in enumerate(
++        zip(
++            uids,
++            seq_rewards,
++            terminal_utilities,
++            purchase_success,
++            sampling_invalid,
++            sampling_invalid_reasons,
++            strict=True,
++        )
++    ):
++        uid, raw_reward, raw_utility, raw_success, raw_invalid, raw_reasons = values
++        try:
++            hash(uid)
++        except TypeError as exc:
++            raise ValueError(f"uid at index {index} is not hashable: {uid!r}") from exc
++        reward = float(raw_reward)
++        utility = float(raw_utility)
++        if not math.isfinite(reward):
++            raise ValueError(f"seq_reward at index {index} is not finite: {raw_reward!r}")
++        if not math.isfinite(utility):
++            raise ValueError(
++                f"terminal_utility at index {index} is not finite: {raw_utility!r}"
++            )
++        group = grouped.setdefault(
++            uid,
++            {
++                "uid": uid,
++                "indices": [],
++                "rewards": [],
++                "terminal_utilities": [],
++                "purchase_success": [],
++                "sampling_invalid": [],
++                "sampling_invalid_reasons": [],
++            },
++        )
++        group["indices"].append(index)
++        group["rewards"].append(reward)
++        group["terminal_utilities"].append(utility)
++        group["purchase_success"].append(bool(raw_success))
++        group["sampling_invalid"].append(bool(raw_invalid))
++        group["sampling_invalid_reasons"].append(tuple(str(reason) for reason in raw_reasons))
++
++    kept_indices: list[int] = []
++    kept_uids: list[Hashable] = []
++    groups: list[dict[str, Any]] = []
++    for uid, group in grouped.items():
++        valid_positions = [
++            position
++            for position, invalid in enumerate(group["sampling_invalid"])
++            if not invalid
++        ]
++        retained_indices = tuple(group["indices"][position] for position in valid_positions)
++        retained_utilities = tuple(
++            group["terminal_utilities"][position] for position in valid_positions
++        )
++        retained_rewards = tuple(group["rewards"][position] for position in valid_positions)
++        retained_success = tuple(
++            group["purchase_success"][position] for position in valid_positions
++        )
++        valid_count = len(retained_indices)
++        utility_varying = (
++            valid_count >= min_valid_trajectories
++            and max(retained_utilities) - min(retained_utilities) > tolerance
++        )
++        if valid_count < min_valid_trajectories:
++            drop_reason = "insufficient_valid_trajectories"
++        elif not utility_varying:
++            drop_reason = "constant_valid_reward"
++        else:
++            drop_reason = None
++        keep = drop_reason is None
++        if keep:
++            kept_uids.append(uid)
++            kept_indices.extend(retained_indices)
++        reasons = tuple(
++            sorted(
++                {
++                    reason
++                    for reasons_for_member in group["sampling_invalid_reasons"]
++                    for reason in reasons_for_member
++                }
++            )
++        )
++        groups.append(
++            {
++                "uid": uid,
++                "indices": tuple(group["indices"]),
++                "rewards": tuple(group["rewards"]),
++                "terminal_utilities": tuple(group["terminal_utilities"]),
++                "purchase_success": tuple(group["purchase_success"]),
++                "sampling_invalid_members": tuple(group["sampling_invalid"]),
++                "sampling_invalid": any(group["sampling_invalid"]),
++                "sampling_invalid_reasons": reasons,
++                "retained_indices": retained_indices,
++                "retained_rewards": retained_rewards,
++                "retained_terminal_utilities": retained_utilities,
++                "retained_purchase_success": retained_success,
++                "valid_trajectory_count": valid_count,
++                "partial_valid": valid_count < len(group["indices"]),
++                "reward_varying": utility_varying,
++                "drop_reason": drop_reason,
++                "kept": keep,
++            }
++        )
++
++    stats = {
++        "num_trajectories": len(uids),
++        "num_groups": len(grouped),
++        "kept_group_count": len(kept_uids),
++        "dropped_group_count": len(groups) - len(kept_uids),
++        "kept_uids": tuple(kept_uids),
++        "kept_trajectory_count": len(kept_indices),
++        "partial_kept_group_count": sum(
++            group["kept"] and group["partial_valid"] for group in groups
++        ),
++        "insufficient_valid_group_count": sum(
++            group["drop_reason"] == "insufficient_valid_trajectories"
++            for group in groups
++        ),
++        "constant_valid_group_count": sum(
++            group["drop_reason"] == "constant_valid_reward" for group in groups
++        ),
++        "sampling_invalid_group_count": sum(
++            any(group["sampling_invalid_members"]) for group in groups
++        ),
++        "all_equal_group_count": sum(not group["reward_varying"] for group in groups),
++        "all_zero_utility_group_count": sum(
++            max(abs(value) for value in group["terminal_utilities"]) <= tolerance
++            for group in groups
++        ),
++        "all_purchase_success_group_count": sum(
++            all(group["purchase_success"]) for group in groups
++        ),
++        "no_purchase_success_group_count": sum(
++            not any(group["purchase_success"]) for group in groups
++        ),
++        "groups": tuple(groups),
++    }
++    return kept_indices, stats
++
++
++def select_exact_trajectory_pack(
++    group_sizes: Sequence[int], target_trajectories: int
++) -> tuple[int, ...] | None:
++    """Return a deterministic subset of group positions that exactly fills a batch.
++
++    Retained partial groups have two to four trajectories.  The actor's FSDP
++    minibatch must still have a globally divisible size, so greedy acceptance is
++    insufficient (for example, ``3 + 4`` blocks a later ``3 + 2`` pack for 8).
++    """
++    if target_trajectories <= 0:
++        raise ValueError("target_trajectories must be positive")
++    reachable: dict[int, tuple[int, ...]] = {0: ()}
++    for position, raw_size in enumerate(group_sizes):
++        size = int(raw_size)
++        if size <= 0:
++            raise ValueError(f"group size at position {position} must be positive")
++        for total in sorted(tuple(reachable), reverse=True):
++            next_total = total + size
++            if next_total <= target_trajectories and next_total not in reachable:
++                reachable[next_total] = reachable[total] + (position,)
++    return reachable.get(target_trajectories)
++
++
++def select_largest_divisible_trajectory_pack(
++    group_sizes: Sequence[int], *, max_trajectories: int, divisor: int, min_trajectories: int = 2
++) -> tuple[int, ...] | None:
++    """Select the largest pack whose trajectory count is divisible across DP ranks."""
++    if max_trajectories <= 0 or divisor <= 0 or min_trajectories <= 0:
++        raise ValueError("packing bounds and divisor must be positive")
++    for target in range(max_trajectories, min_trajectories - 1, -1):
++        if target % divisor == 0:
++            pack = select_exact_trajectory_pack(group_sizes, target)
++            if pack is not None:
++                return pack
++    return None
+diff --git a/src/shopping_grpo/training/sft/dataset.py b/src/shopping_grpo/training/sft/dataset.py
+index 3ceb28f..bb019a1 100644
+--- a/src/shopping_grpo/training/sft/dataset.py
++++ b/src/shopping_grpo/training/sft/dataset.py
+@@ -62,14 +62,18 @@ def build_supervised_example(messages, tools, tokenizer, max_length=8192, chat_t
+     """
+     # 原始消息保持 OpenAI 格式；只在这里为目标 chat template 做训练期转换。
+     template = chat_template or tokenizer
++    trainable_assistant_indices = [
++        index
++        for index, message in enumerate(messages)
++        if message.get("role") == "assistant" and message.get("train", True) is not False
++    ]
+     rendered_messages = normalize_messages_for_chat_template(messages)
+     if rendered_messages is None:
+         return None
+-    assistant_indices = [
+-        index
+-        for index, message in enumerate(rendered_messages)
+-        if message.get("role") == "assistant"
+-    ]
++    # ``train`` is an internal recovery-supervision annotation, never a chat-template field.
++    for message in rendered_messages:
++        message.pop("train", None)
++    assistant_indices = trainable_assistant_indices
+     if not assistant_indices:
+         return None
+ 
+diff --git a/tests/test_sft_training.py b/tests/test_sft_training.py
+index a653619..34c896f 100644
+--- a/tests/test_sft_training.py
++++ b/tests/test_sft_training.py
+@@ -112,6 +112,18 @@ class SftTrainingTest(unittest.TestCase):
+         self.assertNotIn("buy a pillow", labeled)
+         self.assertNotIn("search result: item-1", labeled)
+ 
++    def test_masked_recovery_assistant_is_context_only(self):
++        messages = [
++            {"role": "user", "content": "buy"},
++            {"role": "assistant", "content": "bad", "train": False},
++            {"role": "tool", "content": "guard"},
++            {"role": "assistant", "content": "good"},
++        ]
++        example = build_supervised_example(messages, [], CharacterTokenizer(), max_length=1000)
++        labeled = CharacterTokenizer.decode(token for token in example["labels"] if token != IGNORE_INDEX)
++        self.assertNotIn("bad", labeled)
++        self.assertIn("good", labeled)
++
+     def test_overlong_trajectory_is_dropped_instead_of_truncated(self):
+         """长轨迹不能截断后保留，否则可能只留下半个 tool call。"""
+         example = build_supervised_example(
+diff --git a/tests/test_verl_adapter.py b/tests/test_verl_adapter.py
+index 374e486..4ab8fd3 100644
+--- a/tests/test_verl_adapter.py
++++ b/tests/test_verl_adapter.py
+@@ -40,6 +40,115 @@ def make_tool(name):
+ 
+ 
+ class VerlAdapterRuntimeTest(unittest.TestCase):
++    def test_context_compaction_rebases_event_token_indices(self):
++        # Avoid the parent generation call while exercising the compaction boundary.
++        from shopping_grpo.training.grpo.adapter.agent_loop import AgentState
++        loop = object.__new__(ShoppingToolAgentLoop)
++        loop.context_compaction_enable = True
++        loop.context_input_budget = 9
++        loop.context_window_tokens = 16
++        loop.context_generation_reserve_tokens = 4
++        loop.context_safety_margin_tokens = 1
++        loop.context_preserve_recent_groups = 1
++        loop.response_length = 16
++        loop.tokenizer = type("Tokenizer", (), {})()
++        agent_data = type(
++            "AgentData",
++            (),
++            {
++                "prompt_ids": list(range(12)),
++                "response_mask": [1, 1, 0, 1, 1, 0, 1, 1, 0],
++                "response_logprobs": [],
++                "routed_experts": None,
++                "extra_fields": {
++                    "shopping_events": [
++                        {"token_index": 1, "reward": -0.05},
++                        {"token_index": 7, "reward": -0.03},
++                    ]
++                },
++            },
++        )()
++
++        # compact_token_trajectory drops the first complete group (3 tokens).
++        with patch.object(ToolAgentLoop, "_handle_generating_state", return_value=AgentState.TERMINATED):
++            result = asyncio.run(
++                ShoppingToolAgentLoop._handle_generating_state(loop, agent_data, {})
++            )
++        self.assertEqual(result, AgentState.TERMINATED)
++        self.assertEqual(agent_data.extra_fields["shopping_events"], [{"token_index": 4, "reward": -0.03}])
++
++    def test_tool_event_uses_latest_actor_token_before_observation_tokens(self):
++        async def fake_parent_processing(_loop, agent_data):
++            agent_data.tool_rewards.append(-0.05)
++            agent_data.response_mask.extend([0, 0])
++            return "generating"
++
++        agent_data = type(
++            "AgentData",
++            (),
++            {
++                "tool_calls": [object()],
++                "tool_rewards": [],
++                "response_mask": [1, 1, 0, 1],
++                "extra_fields": {},
++            },
++        )()
++
++        async def run():
++            loop = object.__new__(ShoppingToolAgentLoop)
++            loop.response_length = 16
++            with patch.object(
++                ToolAgentLoop,
++                "_handle_processing_tools_state",
++                fake_parent_processing,
++            ):
++                next_state = await ShoppingToolAgentLoop._handle_processing_tools_state(
++                    loop, agent_data
++                )
++            return next_state
++
++        self.assertEqual(asyncio.run(run()), "generating")
++        self.assertEqual(
++            agent_data.extra_fields["shopping_events"],
++            [{"token_index": 3, "reward": -0.05, "tool_name": ""}],
++        )
++
++    def test_tool_event_keeps_zero_reward_call_as_hgpo_step_boundary(self):
++        async def fake_parent_processing(_loop, agent_data):
++            agent_data.tool_rewards.append(0.0)
++            agent_data.response_mask.extend([0])
++            return "generating"
++
++        tool_call = type("ToolCall", (), {"name": "search_products"})()
++        agent_data = type(
++            "AgentData",
++            (),
++            {
++                "tool_calls": [tool_call],
++                "tool_rewards": [],
++                "response_mask": [1, 1, 0, 1],
++                "extra_fields": {},
++            },
++        )()
++
++        async def run():
++            loop = object.__new__(ShoppingToolAgentLoop)
++            loop.response_length = 16
++            with patch.object(
++                ToolAgentLoop,
++                "_handle_processing_tools_state",
++                fake_parent_processing,
++            ):
++                return await ShoppingToolAgentLoop._handle_processing_tools_state(
++                    loop, agent_data
++                )
++
++        self.assertEqual(asyncio.run(run()), "generating")
++        self.assertEqual(
++            agent_data.extra_fields["shopping_events"],
++            [{"token_index": 3, "reward": 0.0, "tool_name": "search_products"}],
++        )
++
+     def test_agent_loop_preserves_real_verl_metrics_and_exports_shopping_diagnostics(self):
+         created = []
+ 
+diff --git a/tests/test_verl_dynamic_sampling_patch.py b/tests/test_verl_dynamic_sampling_patch.py
+index 063b424..58929a0 100644
+--- a/tests/test_verl_dynamic_sampling_patch.py
++++ b/tests/test_verl_dynamic_sampling_patch.py
+@@ -81,6 +81,44 @@ class VerlPatchScriptTest(unittest.TestCase):
+             self.assertEqual(file_sha256(target), before)
+             self.assertFalse(Path(str(target) + patcher.BACKUP_SUFFIX).exists())
+ 
++    def test_layered_runtime_hash_is_accepted_but_cannot_be_restored(self):
++        with tempfile.TemporaryDirectory() as temp_dir:
++            target = Path(temp_dir) / "ray_trainer.py"
++            installed = patcher.resolve_installed_ray_trainer()
++            if file_sha256(installed) != patcher.EXPECTED_LAYERED_PATCHED_SHA256:
++                self.skipTest("current runtime is not the pinned layered patch state")
++            shutil.copy2(installed, target)
++            shutil.copy2(original_source(), Path(str(target) + patcher.BACKUP_SUFFIX))
++
++            checked = self.run_script(target, "--check")
++            self.assertEqual(checked.returncode, 0, checked.stderr)
++
++            restored = self.run_script(target, "--restore")
++            self.assertNotEqual(restored.returncode, 0)
++            self.assertIn("refusing to restore layered", restored.stderr)
++            self.assertEqual(
++                file_sha256(target), patcher.EXPECTED_LAYERED_PATCHED_SHA256
++            )
++
++    def test_partial_valid_layered_runtime_is_accepted_but_cannot_be_restored(self):
++        with tempfile.TemporaryDirectory() as temp_dir:
++            target = Path(temp_dir) / "ray_trainer.py"
++            installed = patcher.resolve_installed_ray_trainer()
++            if file_sha256(installed) != patcher.EXPECTED_PARTIAL_VALID_LAYERED_SHA256:
++                self.skipTest("current runtime is not the pinned partial-valid layered state")
++            shutil.copy2(installed, target)
++            shutil.copy2(original_source(), Path(str(target) + patcher.BACKUP_SUFFIX))
++
++            checked = self.run_script(target, "--check")
++            self.assertEqual(checked.returncode, 0, checked.stderr)
++
++            restored = self.run_script(target, "--restore")
++            self.assertNotEqual(restored.returncode, 0)
++            self.assertIn("refusing to restore layered", restored.stderr)
++            self.assertEqual(
++                file_sha256(target), patcher.EXPECTED_PARTIAL_VALID_LAYERED_SHA256
++            )
++
+     def test_patched_fit_preserves_bypass_and_defers_reference_and_update(self):
+         with tempfile.TemporaryDirectory() as temp_dir:
+             target = Path(temp_dir) / "ray_trainer.py"

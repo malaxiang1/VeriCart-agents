@@ -1,0 +1,126 @@
+{
+  "expected_tasks": 50,
+  "completed_tasks": 50,
+  "missing_tasks": [],
+  "done_tasks": 45,
+  "done_rate": 0.9,
+  "strict_successes": 33,
+  "strict_success_task_ids": [
+    3413,
+    3904,
+    3993,
+    4817,
+    5499,
+    5638,
+    5787,
+    6017,
+    6492,
+    6557,
+    7018,
+    7130,
+    7496,
+    7518,
+    7801,
+    8327,
+    9235,
+    9518,
+    9523,
+    10120,
+    10269,
+    11491,
+    11619,
+    12122,
+    12367,
+    12881,
+    15592,
+    16037,
+    16198,
+    16800,
+    20475,
+    21405,
+    21835
+  ],
+  "strict_success_rate": 0.66,
+  "reward_contract": "shopsimulator-reward-v3",
+  "reward_version_counts": {
+    "shopsimulator-reward-v3": 45,
+    "unknown": 5
+  },
+  "reward_type_counts": {
+    "gold_purchase": 33,
+    "partial_alternative_purchase": 2,
+    "repeat_loop": 7,
+    "unknown": 5,
+    "wrong_purchase": 3
+  },
+  "reward_type_rates": {
+    "gold_purchase": 0.66,
+    "valid_alternative_purchase": 0.0,
+    "partial_alternative_purchase": 0.04,
+    "wrong_purchase": 0.06,
+    "graceful_stop": 0.0,
+    "early_abstain": 0.0,
+    "repeat_loop": 0.14,
+    "max_steps": 0.0,
+    "reward_unverifiable": 0.0
+  },
+  "purchase_successes": 33,
+  "purchase_success_rate": 0.66,
+  "gold_purchases": 33,
+  "gold_purchase_rate": 0.66,
+  "reward_valid_tasks": 45,
+  "reward_valid_rate": 0.9,
+  "total_final_reward": 25.91875,
+  "mean_final_reward": 0.518375,
+  "mean_terminal_utility": 0.518375,
+  "mean_weighted_score": 0.72875,
+  "average_steps": 10.14,
+  "status_counts": {
+    "done": 45,
+    "invalid_action_limit": 5
+  },
+  "guard_reason_counts": {
+    "click_not_in_previous_observation": 35
+  },
+  "context_projection": {
+    "projected_tool_observations": 507,
+    "truncated_tool_observations": 88,
+    "raw_tokens": 306990,
+    "visible_tokens": 265065,
+    "critical_footer_failures": 0,
+    "visible_asin_count": 1660,
+    "visible_button_count": 5862,
+    "guard_rejections": 35,
+    "guard_rejections_after_truncation": 5,
+    "action_attempts_after_truncation": 90,
+    "guard_rejection_rate_after_truncation": 0.05555555555555555,
+    "context_overflow_tasks": 0,
+    "max_context_input_tokens": 21849,
+    "success_by_truncation_bucket": {
+      "none": {
+        "tasks": 0,
+        "strict_successes": 0
+      },
+      "any": {
+        "tasks": 50,
+        "strict_successes": 33
+      }
+    }
+  },
+  "protocol": {
+    "benchmark": "third_party/shopping-grpo-longhorizon/data/grpo/validation.jsonl",
+    "model": "shopping-agent",
+    "reward_contract": "shopsimulator-reward-v3",
+    "max_steps": 35,
+    "max_tokens": 512,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "context_window": 24576,
+    "context_safety_margin": 512,
+    "context_compaction": true,
+    "observation_token_budget": 1536,
+    "observation_detail_token_budget": 4096,
+    "observation_generic_token_budget": 768,
+    "observation_search_top_k": 20
+  }
+}
